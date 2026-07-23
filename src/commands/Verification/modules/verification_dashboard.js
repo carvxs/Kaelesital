@@ -1,716 +1,602 @@
-import { botConfig, getColor } from '../../../config/bot.js';
-import {
-    ActionRowBuilder,
-    StringSelectMenuBuilder,
-    StringSelectMenuOptionBuilder,
-    ModalBuilder,
-    TextInputBuilder,
-    TextInputStyle,
-    ChannelSelectMenuBuilder,
-    RoleSelectMenuBuilder,
-    ButtonBuilder,
-    ButtonStyle,
-    ChannelType,
-    MessageFlags,
-    ComponentType,
-    EmbedBuilder,
-} from 'discord.js';
-import { InteractionHelper } from '../../../utils/interactionHelper.js';
-import { successEmbed } from '../../../utils/embeds.js';
-import { logger } from '../../../utils/logger.js';
-import { TitanBotError, ErrorTypes, replyUserError } from '../../../utils/errorHandler.js';
-import { getGuildConfig, setGuildConfig } from '../../../services/config/guildConfig.js';
-import { getWelcomeConfig } from '../../../utils/database.js';
-import { botHasPermission } from '../../../utils/permissionGuard.js';
-import {
-    getVerificationPanelStatus,
-    formatPanelStatusField,
-} from '../../../utils/panelStatus.js';
-import { startDashboardSession } from '../../../utils/dashboardSession.js';
-
-async function updateLivePanel(guild, cfg) {
-    if (!cfg.channelId || !cfg.messageId) return;
+// verificationService.js
+import { PermissionFlagsBits } from 'discord.js';
+import { botConfig } from '../config/bot.js';
+import { logger } from '../utils/logger.js';
+import { getGuildConfig, setGuildConfig } from './config/guildConfig.js';
+import { createError, ErrorTypes } from '../utils/errorHandler.js';
+import { insertVerificationAudit } from '../utils/database.js';
+import { ensureTypedServiceError } from '../utils/serviceErrorBoundary.js';
+const verificationCooldowns = new Map();
+const attemptTracker = new Map();
+const verificationDefaults = botConfig?.verification || {};
+const autoVerifyDefaults = verificationDefaults.autoVerify || {};
+const minAutoVerifyAccountAgeDays = autoVerifyDefaults.minAccountAge ?? 1;
+const maxAutoVerifyAccountAgeDays = autoVerifyDefaults.maxAccountAge ?? 365;
+const serverSizeThreshold = autoVerifyDefaults.serverSizeThreshold ?? 1000;
+const defaultCooldownMs = verificationDefaults.verificationCooldown ?? 5000;
+const defaultMaxAttempts = verificationDefaults.maxVerificationAttempts ?? 3;
+const defaultAttemptWindowMs = verificationDefaults.attemptWindow ?? 60000;
+const maxCooldownEntries = verificationDefaults.maxCooldownEntries ?? 10000;
+const maxAttemptEntries = verificationDefaults.maxAttemptEntries ?? 10000;
+const cooldownCleanupIntervalMs = verificationDefaults.cooldownCleanupInterval ?? 300000;
+const maxAuditMetadataBytes = verificationDefaults.maxAuditMetadataBytes ?? 4096;
+const shouldSendAutoVerifyDm = autoVerifyDefaults.sendDMNotification ?? true;
+const shouldLogVerifications = verificationDefaults.logAllVerifications ?? true;
+const shouldKeepAuditTrail = verificationDefaults.keepAuditTrail ?? false;
+let lastCleanupAt = 0;
+export async function verifyUser(client, guildId, userId, options = {}) {
+    const { source = 'manual', moderatorId = null } = options;
+   
     try {
-        const channel = guild.channels.cache.get(cfg.channelId);
-        if (!channel) return;
-        const msg = await channel.messages.fetch(cfg.messageId).catch(() => null);
-        if (!msg) return;
-
-        const verifyEmbed = new EmbedBuilder()
-            .setTitle('Server Verification')
-            .setDescription(cfg.message || botConfig.verification.defaultMessage)
-            .setColor(getColor('success'));
-
-        const verifyButton = new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-                .setCustomId('verify_user')
-                .setLabel(cfg.buttonText || botConfig.verification.defaultButtonText)
-                .setStyle(ButtonStyle.Success)
-                .setEmoji('✅'),
-        );
-
-        await msg.edit({ embeds: [verifyEmbed], components: [verifyButton] });
+       
+        const guild = client.guilds.cache.get(guildId);
+        if (!guild) {
+            throw createError(
+                `Guild ${guildId} not found`,
+                ErrorTypes.CONFIGURATION,
+                "Guild not found in bot cache.",
+                { guildId }
+            );
+        }
+        let member;
+        try {
+            member = await guild.members.fetch(userId);
+        } catch (error) {
+            throw createError(
+                `Member ${userId} not found in guild`,
+                ErrorTypes.USER_INPUT,
+                "User is not in this server.",
+                { userId, guildId }
+            );
+        }
+        const guildConfig = await getGuildConfig(client, guildId);
+       
+        if (!guildConfig.verification?.enabled) {
+            throw createError(
+                "Verification system disabled",
+                ErrorTypes.CONFIGURATION,
+                "The verification system is not enabled on this server.",
+                { guildId }
+            );
+        }
+        await validateVerificationSetup(guild, guildConfig.verification);
+        const verifiedRole = guild.roles.cache.get(guildConfig.verification.roleId);
+        const canAssignRole = await validateBotCanAssignRole(guild, verifiedRole.id);
+        if (!canAssignRole) {
+            throw createError(
+                'Bot cannot assign verified role',
+                ErrorTypes.PERMISSION,
+                "I can't assign the verified role. Please check my **Manage Roles** permission and role hierarchy.",
+                { guildId, roleId: verifiedRole.id }
+            );
+        }
+        if (member.roles.cache.has(verifiedRole.id)) {
+            return {
+                status: 'already_verified',
+                userId,
+                roleId: verifiedRole.id,
+                roleName: verifiedRole.name,
+            };
+        }
+        await checkVerificationCooldown(userId, guildId, defaultCooldownMs);
+        await trackVerificationAttempt(userId, guildId, defaultMaxAttempts, defaultAttemptWindowMs);
+        await member.roles.add(verifiedRole.id, `User verified (${source})`);
+        logVerificationAction(client, guildId, userId, 'verified', {
+            source,
+            roleId: verifiedRole.id,
+            roleName: verifiedRole.name,
+            moderatorId
+        });
+        logger.info('User verified successfully', {
+            guildId,
+            userId,
+            roleId: verifiedRole.id,
+            source,
+            moderatorId
+        });
+        return {
+            status: 'verified',
+            userId,
+            roleId: verifiedRole.id,
+            roleName: verifiedRole.name,
+        };
     } catch (error) {
-        logger.warn('Could not update live verification panel:', error.message);
+        const typedError = ensureTypedServiceError(error, {
+            service: 'verificationService',
+            operation: 'verifyUser',
+            type: ErrorTypes.UNKNOWN,
+            message: 'Verification operation failed: verifyUser',
+            userMessage: 'Verification failed. Please try again in a moment.',
+            context: { guildId, userId, source: options.source }
+        });
+        logger.error('Error verifying user', {
+            guildId,
+            userId,
+            source: options.source,
+            error: typedError.message,
+            errorCode: typedError.context?.errorCode
+        });
+        throw typedError;
     }
 }
-
-function buildDashboardEmbed(cfg, guild, verifiedUserCount = 0, conflictSummary = '', panelStatus = null) {
-    const channel = cfg.channelId ? `<#${cfg.channelId}>` : '`Not set`';
-    const role = cfg.roleId ? `<@&${cfg.roleId}>` : '`Not set`';
-    const rawMsg = cfg.message || botConfig.verification.defaultMessage;
-    const msgPreview = `\`${rawMsg.length > 60 ? rawMsg.substring(0, 60) + '…' : rawMsg}\``;
-    const buttonText = cfg.buttonText || botConfig.verification.defaultButtonText;
-    const panelStatusValue = cfg.channelId ? formatPanelStatusField(panelStatus) : '`Not configured`';
-
-    const embed = new EmbedBuilder()
-        .setTitle('✅ Verification System Dashboard')
-        .setDescription(`Manage verification settings for **${guild.name}**.\nSelect an option below to modify a setting.`)
-        .setColor(getColor('info'))
-        .addFields(
-            { name: 'Panel Status', value: panelStatusValue, inline: false },
-            { name: 'Verification Channel', value: channel, inline: true },
-            { name: 'Verified Role', value: role, inline: true },
-            { name: 'System Status', value: cfg.enabled !== false ? 'Enabled' : 'Disabled', inline: true },
-            { name: 'Button Text', value: `\`${buttonText}\``, inline: true },
-            { name: 'Verified Users', value: `${verifiedUserCount} users`, inline: true },
-            { name: '\u200B', value: '\u200B', inline: true },
-            { name: 'Verification Message', value: msgPreview, inline: false },
-        );
-
-    if (conflictSummary) {
-        embed.addFields({ name: 'Setup Conflicts', value: conflictSummary, inline: false });
+function pruneVerificationTrackers(now = Date.now()) {
+    if (now - lastCleanupAt < cooldownCleanupIntervalMs) {
+        return;
     }
-
-    return embed
-        .setFooter({ text: 'Dashboard closes after 10 minutes of inactivity' })
-        .setTimestamp();
-}
-
-function buildSelectMenu(guildId) {
-    return new StringSelectMenuBuilder()
-        .setCustomId(`verif_cfg_${guildId}`)
-        .setPlaceholder('Select a setting to configure...')
-        .addOptions(
-            new StringSelectMenuOptionBuilder()
-                .setLabel('Change Verification Channel')
-                .setDescription('Set the channel where the verification panel is posted')
-                .setValue('channel')
-                .setEmoji('📢'),
-            new StringSelectMenuOptionBuilder()
-                .setLabel('Change Verified Role')
-                .setDescription('Set the role assigned when a user verifies')
-                .setValue('role')
-                .setEmoji('🏷️'),
-            new StringSelectMenuOptionBuilder()
-                .setLabel('Edit Verification Message')
-                .setDescription('Customise the message shown on the verification panel embed')
-                .setValue('message')
-                .setEmoji('💬'),
-            new StringSelectMenuOptionBuilder()
-                .setLabel('Edit Button Text')
-                .setDescription('Change the label on the verify button')
-                .setValue('button_text')
-                .setEmoji('🔘'),
-            new StringSelectMenuOptionBuilder()
-                .setLabel('Change Unverified Role')
-                .setDescription('Set the role that gets removed when user verifies')
-                .setValue('unverified_role')
-                .setEmoji('🚫'),
-        );
-}
-
-function buildButtonRow(cfg, guildId, disabled = false, panelStatus = null) {
-    const systemOn = cfg.enabled !== false;
-    const showRepost =
-        systemOn && panelStatus?.exists === false && panelStatus?.reason === 'panel_deleted';
-
-    const buttons = [];
-
-    if (showRepost) {
-        buttons.push(
-            new ButtonBuilder()
-                .setCustomId(`verif_cfg_repost_${guildId}`)
-                .setLabel('Repost Panel')
-                .setStyle(ButtonStyle.Primary)
-                .setEmoji('📌')
-                .setDisabled(disabled),
-        );
+    lastCleanupAt = now;
+    for (const [key, timestamp] of verificationCooldowns.entries()) {
+        if (now - timestamp > Math.max(defaultCooldownMs * 2, 60000)) {
+            verificationCooldowns.delete(key);
+        }
     }
-
-    buttons.push(
-        new ButtonBuilder()
-            .setCustomId(`verif_cfg_toggle_${guildId}`)
-            .setLabel('Verification')
-            .setStyle(systemOn ? ButtonStyle.Success : ButtonStyle.Danger)
-            .setEmoji('🔒')
-            .setDisabled(disabled),
-    );
-
-    return new ActionRowBuilder().addComponents(buttons);
+    for (const [key, attempts] of attemptTracker.entries()) {
+        const recentAttempts = (attempts || []).filter(ts => now - ts < defaultAttemptWindowMs);
+        if (recentAttempts.length === 0) {
+            attemptTracker.delete(key);
+            continue;
+        }
+        attemptTracker.set(key, recentAttempts);
+    }
+    while (verificationCooldowns.size > maxCooldownEntries) {
+        const firstKey = verificationCooldowns.keys().next().value;
+        if (!firstKey) {
+            break;
+        }
+        verificationCooldowns.delete(firstKey);
+    }
+    while (attemptTracker.size > maxAttemptEntries) {
+        const firstKey = attemptTracker.keys().next().value;
+        if (!firstKey) {
+            break;
+        }
+        attemptTracker.delete(firstKey);
+    }
 }
-
-async function repostVerificationPanel(guild, cfg) {
-    const channel = await guild.channels.fetch(cfg.channelId).catch(() => null);
-    if (!channel) {
-        throw new TitanBotError(
-            'Panel channel missing',
+export async function autoVerifyOnJoin(client, guild, member, verificationConfig) {
+    try {
+       
+        if (!verificationConfig.autoVerify?.enabled) {
+            return {
+                autoVerified: false,
+                reason: 'auto_verify_disabled'
+            };
+        }
+        const autoVerifyRoleId = verificationConfig.autoVerify?.roleId || verificationConfig.roleId;
+        if (!autoVerifyRoleId) {
+            return {
+                autoVerified: false,
+                reason: 'auto_verify_role_not_configured'
+            };
+        }
+        const effectiveVerificationConfig = {
+            ...verificationConfig,
+            roleId: autoVerifyRoleId
+        };
+        await validateVerificationSetup(guild, effectiveVerificationConfig);
+        const shouldVerify = evaluateAutoVerifyCriteria(
+            member,
+            verificationConfig.autoVerify
+        );
+        if (!shouldVerify) {
+            return {
+                autoVerified: false,
+                reason: 'criteria_not_met',
+                criteria: verificationConfig.autoVerify.criteria
+            };
+        }
+        const verifiedRole = guild.roles.cache.get(autoVerifyRoleId);
+        const canAssign = await validateBotCanAssignRole(guild, verifiedRole.id);
+        if (!canAssign) {
+            logger.warn('Cannot auto-verify: bot cannot assign role', {
+                guildId: guild.id,
+                userId: member.id,
+                roleId: verifiedRole.id
+            });
+            return {
+                autoVerified: false,
+                reason: 'bot_cannot_assign_role'
+            };
+        }
+        if (member.roles.cache.has(verifiedRole.id)) {
+            return {
+                autoVerified: false,
+                reason: 'already_verified',
+                alreadyHasRole: true
+            };
+        }
+        await member.roles.add(verifiedRole.id, 'Auto-verified on join');
+        logVerificationAction(client, guild.id, member.id, 'auto_verified', {
+            criteria: verificationConfig.autoVerify.criteria,
+            accountAge: Date.now() - member.user.createdTimestamp,
+            roleId: verifiedRole.id,
+            roleName: verifiedRole.name
+        });
+        logger.info('User auto-verified on join', {
+            guildId: guild.id,
+            userId: member.id,
+            userTag: member.user.tag,
+            criteria: verificationConfig.autoVerify.criteria,
+            accountAge: Date.now() - member.user.createdTimestamp
+        });
+        if (shouldSendAutoVerifyDm) {
+            await sendAutoVerifyNotification(member, verifiedRole, guild);
+        }
+        return {
+            autoVerified: true,
+            userId: member.id,
+            roleId: verifiedRole.id,
+            roleName: verifiedRole.name,
+            criteria: verificationConfig.autoVerify.criteria
+        };
+    } catch (error) {
+        const typedError = ensureTypedServiceError(error, {
+            service: 'verificationService',
+            operation: 'autoVerifyOnJoin',
+            type: ErrorTypes.UNKNOWN,
+            message: 'Verification operation failed: autoVerifyOnJoin',
+            userMessage: 'Automatic verification failed. Please verify manually.',
+            context: { guildId: guild.id, userId: member.id }
+        });
+        logger.error('Error in auto-verification on join', {
+            guildId: guild.id,
+            userId: member.id,
+            error: typedError.message,
+            errorCode: typedError.context?.errorCode
+        });
+       
+        return {
+            autoVerified: false,
+            reason: 'auto_verify_error',
+            error: typedError.userMessage || typedError.message,
+            errorCode: typedError.context?.errorCode
+        };
+    }
+}
+export async function removeVerification(client, guildId, userId, options = {}) {
+    const { moderatorId = null, reason = 'admin_removal' } = options;
+   
+    try {
+        const guild = client.guilds.cache.get(guildId);
+        if (!guild) {
+            throw createError(
+                `Guild ${guildId} not found`,
+                ErrorTypes.CONFIGURATION,
+                "Guild not found.",
+                { guildId }
+            );
+        }
+        let member;
+        try {
+            member = await guild.members.fetch(userId);
+        } catch (error) {
+            throw createError(
+                `Member ${userId} not found`,
+                ErrorTypes.USER_INPUT,
+                "User is not in this server.",
+                { userId }
+            );
+        }
+        const guildConfig = await getGuildConfig(client, guildId);
+       
+        if (!guildConfig.verification?.enabled) {
+            throw createError(
+                "Verification system disabled",
+                ErrorTypes.CONFIGURATION,
+                "The verification system is not enabled.",
+                { guildId }
+            );
+        }
+        const verifiedRole = guild.roles.cache.get(guildConfig.verification.roleId);
+        if (!verifiedRole) {
+            throw createError(
+                "Verified role not found",
+                ErrorTypes.CONFIGURATION,
+                "The verified role no longer exists.",
+                { roleId: guildConfig.verification.roleId }
+            );
+        }
+        const canAssignRole = await validateBotCanAssignRole(guild, verifiedRole.id);
+        if (!canAssignRole) {
+            throw createError(
+                'Bot cannot manage verified role',
+                ErrorTypes.PERMISSION,
+                "I can't remove the verified role right now. Please check my **Manage Roles** permission and role hierarchy.",
+                { guildId, roleId: verifiedRole.id }
+            );
+        }
+        if (!member.roles.cache.has(verifiedRole.id)) {
+            return {
+                status: 'not_verified',
+                userId,
+            };
+        }
+        await member.roles.remove(
+            verifiedRole.id,
+            `Verification removed by ${moderatorId || 'system'}: ${reason}`
+        );
+        logVerificationAction(client, guildId, userId, 'removed', {
+            removedBy: moderatorId,
+            reason,
+            roleId: verifiedRole.id,
+            roleName: verifiedRole.name
+        });
+        logger.info('Verification removed from user', {
+            guildId,
+            userId,
+            removedBy: moderatorId,
+            reason
+        });
+        return {
+            status: 'removed',
+            userId,
+            roleId: verifiedRole.id,
+        };
+    } catch (error) {
+        const typedError = ensureTypedServiceError(error, {
+            service: 'verificationService',
+            operation: 'removeVerification',
+            type: ErrorTypes.UNKNOWN,
+            message: 'Verification operation failed: removeVerification',
+            userMessage: 'Failed to remove verification. Please try again in a moment.',
+            context: { guildId, userId, reason }
+        });
+        logger.error('Error removing verification', {
+            guildId,
+            userId,
+            error: typedError.message,
+            errorCode: typedError.context?.errorCode
+        });
+        throw typedError;
+    }
+}
+export async function validateVerificationSetup(guild, verificationConfig) {
+    const botMember = guild.members.me;
+    if (!botMember) {
+        throw createError(
+            'Bot member not available in guild cache',
             ErrorTypes.CONFIGURATION,
-            'The configured verification channel no longer exists. Set a new channel from the dashboard.',
+            "I couldn't verify my server permissions. Please try again.",
+            { guildId: guild.id }
         );
     }
-
-    const verifyEmbed = new EmbedBuilder()
-        .setTitle('Server Verification')
-        .setDescription(cfg.message || botConfig.verification.defaultMessage)
-        .setColor(getColor('success'));
-
-    const verifyButton = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-            .setCustomId('verify_user')
-            .setLabel(cfg.buttonText || botConfig.verification.defaultButtonText)
-            .setStyle(ButtonStyle.Success)
-            .setEmoji('✅'),
-    );
-
-    return channel.send({ embeds: [verifyEmbed], components: [verifyButton] });
+    const verifiedRole = guild.roles.cache.get(verificationConfig.roleId);
+    if (!verifiedRole) {
+        throw createError(
+            "Verified role not found",
+            ErrorTypes.CONFIGURATION,
+            "The verified role was deleted. Please run `/verification setup` again.",
+            { roleId: verificationConfig.roleId, guildId: guild.id }
+        );
+    }
+    if (verificationConfig.channelId) {
+        const channel = guild.channels.cache.get(verificationConfig.channelId);
+        if (!channel) {
+            throw createError(
+                "Verification channel not found",
+                ErrorTypes.CONFIGURATION,
+                "The verification channel was deleted.",
+                { channelId: verificationConfig.channelId, guildId: guild.id }
+            );
+        }
+        const botPerms = channel.permissionsFor(botMember);
+        const requiredPerms = ['ViewChannel', 'SendMessages', 'EmbedLinks'];
+        const missingPerms = requiredPerms.filter(perm => !botPerms.has(perm));
+        if (missingPerms.length > 0) {
+            throw createError(
+                "Bot missing permissions in verification channel",
+                ErrorTypes.PERMISSION,
+                `I'm missing permissions in the verification channel: ${missingPerms.join(', ')}`,
+                { missingPerms, channelId: channel.id }
+            );
+        }
+    }
+    return true;
 }
-
-async function refreshDashboard(rootInteraction, cfg, guildId, client) {
+export async function validateBotCanAssignRole(guild, roleId) {
+    const role = guild.roles.cache.get(roleId);
+   
+    if (!role) {
+        logger.warn('Cannot assign role - role not found', {
+            guildId: guild.id,
+            roleId
+        });
+        return false;
+    }
+    const botMember = guild.members.me;
+    if (!botMember) {
+        logger.warn('Cannot assign role - bot member not found in guild cache', {
+            guildId: guild.id,
+            roleId
+        });
+        return false;
+    }
+    if (!botMember.permissions.has(PermissionFlagsBits.ManageRoles)) {
+        logger.warn('Cannot assign role - missing ManageRoles permission', {
+            guildId: guild.id,
+            roleId
+        });
+        return false;
+    }
+    const botHighest = botMember.roles.highest;
+    if (role.position >= botHighest.position) {
+        logger.warn('Cannot assign role - role hierarchy issue', {
+            guildId: guild.id,
+            roleId,
+            rolePosition: role.position,
+            botHighestPosition: botHighest.position
+        });
+        return false;
+    }
+    return true;
+}
+function evaluateAutoVerifyCriteria(member, autoVerifyConfig) {
+    const { criteria, accountAgeDays } = autoVerifyConfig;
+    switch (criteria) {
+        case 'account_age': {
+            const accountAge = Date.now() - member.user.createdTimestamp;
+            const requiredAge = accountAgeDays * 24 * 60 * 60 * 1000;
+            return accountAge >= requiredAge;
+        }
+        case 'server_size':
+            return member.guild.memberCount < serverSizeThreshold;
+        case 'none':
+            return true;
+        default:
+            logger.warn('Unknown auto-verify criteria', { criteria });
+            return false;
+    }
+}
+export async function checkVerificationCooldown(userId, guildId, cooldownMs = defaultCooldownMs) {
+    pruneVerificationTrackers();
+    const key = `${guildId}:${userId}`;
+    const lastVerified = verificationCooldowns.get(key);
+   
+    if (lastVerified && Date.now() - lastVerified < cooldownMs) {
+        const remaining = cooldownMs - (Date.now() - lastVerified);
+        throw createError(
+            "User on verification cooldown",
+            ErrorTypes.RATE_LIMIT,
+            `Please wait ${Math.ceil(remaining / 1000)} seconds before verifying again.`,
+            { userId, guildId, cooldownRemaining: remaining }
+        );
+    }
+   
+    verificationCooldowns.set(key, Date.now());
+}
+export async function trackVerificationAttempt(
+    userId,
+    guildId,
+    maxAttempts = defaultMaxAttempts,
+    windowMs = defaultAttemptWindowMs
+) {
+    pruneVerificationTrackers();
+    const key = `${guildId}:${userId}`;
+    const attempts = attemptTracker.get(key) || [];
+    const now = Date.now();
+    const recentAttempts = attempts.filter(timestamp => now - timestamp < windowMs);
+    if (recentAttempts.length >= maxAttempts) {
+        throw createError(
+            "Too many verification attempts",
+            ErrorTypes.RATE_LIMIT,
+            "You've attempted too many times. Please wait a moment.",
+            { attempts: recentAttempts.length, maxAttempts }
+        );
+    }
+    recentAttempts.push(now);
+    attemptTracker.set(key, recentAttempts);
+}
+async function sendAutoVerifyNotification(member, role, guild) {
     try {
-        const selectMenu = buildSelectMenu(guildId);
-
-        let verifiedUserCount = 0;
-        let conflictSummary = '';
-        let panelStatus = null;
-
-        if (cfg.channelId && cfg.enabled !== false) {
-            panelStatus = await getVerificationPanelStatus(client, rootInteraction.guild, cfg);
-            if (panelStatus.recoveredId) {
-                cfg.messageId = panelStatus.recoveredId;
-                const latestConfig = await getGuildConfig(client, guildId);
-                latestConfig.verification = cfg;
-                await setGuildConfig(client, guildId, latestConfig);
-            }
-        }
-        
-        try {
-            const verifiedRole = rootInteraction.guild.roles.cache.get(cfg.roleId);
-            if (verifiedRole) {
-                verifiedUserCount = verifiedRole.members.size;
-            }
-            
-            const guildConfig = await getGuildConfig(client, guildId);
-            const welcomeConfig = await getWelcomeConfig(client, guildId);
-            const autoVerifyEnabled = Boolean(guildConfig.verification?.autoVerify?.enabled);
-            const autoRoleConfigured = Boolean(guildConfig.autoRole) || (Array.isArray(welcomeConfig.roleIds) && welcomeConfig.roleIds.length > 0);
-            
-            const conflicts = [
-                autoVerifyEnabled ? 'AutoVerify is enabled' : null,
-                autoRoleConfigured ? 'AutoRole is configured' : null
-            ].filter(Boolean);
-            
-            if (conflicts.length > 0) {
-                conflictSummary = conflicts.join('\n');
-            }
-        } catch (error) {
-            logger.warn('Could not fetch verification dashboard details:', error.message);
-        }
-        
-        await InteractionHelper.safeEditReply(rootInteraction, {
-            embeds: [buildDashboardEmbed(cfg, rootInteraction.guild, verifiedUserCount, conflictSummary, panelStatus)],
-            components: [
-                buildButtonRow(cfg, guildId, false, panelStatus),
-                new ActionRowBuilder().addComponents(selectMenu),
+        const { createEmbed } = await import('../utils/embeds.js');
+       
+        const embed = createEmbed({
+            title: "🎉 Welcome to the Server!",
+            description: `You have been automatically verified in **${guild.name}**!`,
+            fields: [
+                {
+                    name: "✅ Role Assigned",
+                    value: `You now have the ${role} role!`,
+                    inline: false
+                },
+                {
+                    name: "📖 What's Next?",
+                    value: "You now have access to all server channels and features. Welcome!",
+                    inline: false
+                }
             ],
-            flags: MessageFlags.Ephemeral,
+            color: 'success'
         });
+        await member.send({ embeds: [embed] });
     } catch (error) {
-        logger.debug('Could not refresh verification dashboard (interaction may have expired):', error.message);
+        logger.debug('Could not send auto-verify DM notification', {
+            userId: member.id,
+            guildId: guild.id,
+            reason: error.message
+        });
+       
     }
 }
-
+function logVerificationAction(client, guildId, userId, action, metadata = {}) {
+    if (!shouldLogVerifications) {
+        return;
+    }
+    const sanitizedMetadata = sanitizeAuditMetadata(metadata);
+    logger.info('Verification action', {
+        guildId,
+        userId,
+        action,
+        timestamp: new Date().toISOString(),
+        metadata: sanitizedMetadata
+    });
+    if (!shouldKeepAuditTrail) {
+        return;
+    }
+    const moderatorId = metadata.moderatorId || metadata.removedBy || null;
+    const source = metadata.source || null;
+    void insertVerificationAudit({
+        guildId,
+        userId,
+        action,
+        source,
+        moderatorId,
+        metadata: sanitizedMetadata,
+        createdAt: new Date().toISOString()
+    });
+}
+function sanitizeAuditMetadata(metadata = {}) {
+    try {
+        const payload = metadata && typeof metadata === 'object' ? metadata : { value: metadata };
+        const json = JSON.stringify(payload);
+        if (!json) {
+            return {};
+        }
+        if (Buffer.byteLength(json, 'utf8') <= maxAuditMetadataBytes) {
+            return payload;
+        }
+        return {
+            truncated: true,
+            originalBytes: Buffer.byteLength(json, 'utf8'),
+            preview: json.slice(0, Math.max(0, maxAuditMetadataBytes - 32))
+        };
+    } catch {
+        return {
+            invalidMetadata: true,
+            reason: 'Failed to serialize metadata'
+        };
+    }
+}
+export function validateAutoVerifyCriteria(criteria, accountAgeDays) {
+    const validCriteria = ['account_age', 'server_size', 'none'];
+   
+    if (!validCriteria.includes(criteria)) {
+        throw createError(
+            `Invalid auto-verify criteria: ${criteria}`,
+            ErrorTypes.VALIDATION,
+            "Please select a valid criteria option.",
+            { criteria, validCriteria }
+        );
+    }
+   
+    if (criteria === 'account_age') {
+        if (!accountAgeDays || accountAgeDays < minAutoVerifyAccountAgeDays || accountAgeDays > maxAutoVerifyAccountAgeDays) {
+            throw createError(
+                "Invalid account age days",
+                ErrorTypes.VALIDATION,
+                `Account age must be between ${minAutoVerifyAccountAgeDays} and ${maxAutoVerifyAccountAgeDays} days.`,
+                { accountAgeDays, minAutoVerifyAccountAgeDays, maxAutoVerifyAccountAgeDays }
+            );
+        }
+    }
+   
+    return { criteria, accountAgeDays };
+}
 export default {
-    prefixOnly: false,
-    async execute(interaction, config, client) {
-        try {
-            const guildId = interaction.guild.id;
-            const guildConfig = await getGuildConfig(client, guildId);
-            const cfg = guildConfig.verification;
-
-            if (!cfg?.channelId) {
-                throw new TitanBotError(
-                    'Verification not configured',
-                    ErrorTypes.CONFIGURATION,
-                    'The verification system has not been set up yet. Run `/verification setup` first.',
-                );
-            }
-
-            await InteractionHelper.safeDefer(interaction, { flags: MessageFlags.Ephemeral });
-
-            let verifiedUserCount = 0;
-            let conflictSummary = '';
-            let panelStatus = null;
-
-            if (cfg.channelId && cfg.enabled !== false) {
-                panelStatus = await getVerificationPanelStatus(client, interaction.guild, cfg);
-                if (panelStatus.recoveredId) {
-                    cfg.messageId = panelStatus.recoveredId;
-                    guildConfig.verification = cfg;
-                    await setGuildConfig(client, guildId, guildConfig);
-                }
-            }
-            
-            try {
-                const verifiedRole = interaction.guild.roles.cache.get(cfg.roleId);
-                if (verifiedRole) {
-                    verifiedUserCount = verifiedRole.members.size;
-                }
-                
-                const welcomeConfig = await getWelcomeConfig(client, guildId);
-                const autoVerifyEnabled = Boolean(guildConfig.verification?.autoVerify?.enabled);
-                const autoRoleConfigured = Boolean(guildConfig.autoRole) || (Array.isArray(welcomeConfig.roleIds) && welcomeConfig.roleIds.length > 0);
-                
-                const conflicts = [
-                    autoVerifyEnabled ? 'AutoVerify is enabled' : null,
-                    autoRoleConfigured ? 'AutoRole is configured' : null
-                ].filter(Boolean);
-                
-                if (conflicts.length > 0) {
-                    conflictSummary = conflicts.join('\n');
-                }
-            } catch (error) {
-                logger.warn('Could not fetch verification dashboard details:', error.message);
-            }
-
-            await startDashboardSession({
-                interaction,
-                embeds: [buildDashboardEmbed(cfg, interaction.guild, verifiedUserCount, conflictSummary, panelStatus)],
-                components: [
-                    buildButtonRow(cfg, guildId, false, panelStatus),
-                    new ActionRowBuilder().addComponents(buildSelectMenu(guildId)),
-                ],
-                flags: MessageFlags.Ephemeral,
-                selectMenuId: `verif_cfg_${guildId}`,
-                buttonMatcher: (customId) =>
-                    customId === `verif_cfg_toggle_${guildId}` || customId === `verif_cfg_repost_${guildId}`,
-              onSelect: async (selectInteraction) => {
-    const selectedOption = selectInteraction.values[0];
-    switch (selectedOption) {
-        case 'channel':
-            await handleChannel(selectInteraction, interaction, cfg, guildId, client);
-            break;
-        case 'role':
-            await handleRole(selectInteraction, interaction, cfg, guildId, client);
-            break;
-        case 'unverified_role':
-            await handleUnverifiedRole(selectInteraction, interaction, cfg, guildId, client);
-            break;
-        case 'message':
-            await handleMessage(selectInteraction, interaction, cfg, guildId, client);
-            break;
-        case 'button_text':
-            await handleButtonText(selectInteraction, interaction, cfg, guildId, client);
-            break;
-    }
-},
-                    }
-                },
-                onButton: async (btnInteraction) => {
-                    if (btnInteraction.customId === `verif_cfg_repost_${guildId}`) {
-                        await btnInteraction.deferUpdate();
-                        const newMsg = await repostVerificationPanel(interaction.guild, cfg);
-                        cfg.messageId = newMsg.id;
-                        const latestConfig = await getGuildConfig(client, guildId);
-                        latestConfig.verification = cfg;
-                        await setGuildConfig(client, guildId, latestConfig);
-                        await btnInteraction.followUp({
-                            embeds: [successEmbed('Panel Reposted', `Verification panel restored in ${newMsg.channel}.`)],
-                            flags: MessageFlags.Ephemeral,
-                        });
-                        await refreshDashboard(interaction, cfg, guildId, client);
-                        return;
-                    }
-
-                    await btnInteraction.deferUpdate().catch(() => null);
-
-                    const wasEnabled = cfg.enabled !== false;
-                    const autoVerifyEnabled = Boolean(guildConfig.verification?.autoVerify?.enabled);
-
-                    if (!wasEnabled && autoVerifyEnabled) {
-                        await replyUserError(btnInteraction, {
-                            type: ErrorTypes.CONFIGURATION,
-                            message: 'AutoVerify is currently enabled. Please disable AutoVerify first before enabling the manual Verification system.\n\nRun `/autoverify` to access the AutoVerify dashboard.',
-                        });
-                        return;
-                    }
-
-                    cfg.enabled = !wasEnabled;
-
-                    if (!cfg.enabled && cfg.channelId && cfg.messageId) {
-                        const channel = interaction.guild.channels.cache.get(cfg.channelId);
-                        if (channel) {
-                            const msg = await channel.messages.fetch(cfg.messageId).catch(() => null);
-                            if (msg) await msg.delete().catch(() => {});
-                        }
-                    }
-
-                    if (cfg.enabled && cfg.channelId) {
-                        try {
-                            const newMsg = await repostVerificationPanel(interaction.guild, cfg);
-                            cfg.messageId = newMsg.id;
-                        } catch (error) {
-                            logger.warn('Could not re-post verification panel on re-enable:', error.message);
-                        }
-                    }
-
-                    const latestConfig = await getGuildConfig(client, guildId);
-                    latestConfig.verification = cfg;
-                    await setGuildConfig(client, guildId, latestConfig);
-
-                    await btnInteraction.followUp({
-                        embeds: [
-                            successEmbed(
-                                '✅ System Updated',
-                                `The verification system is now **${cfg.enabled ? 'enabled' : 'disabled'}**.`,
-                            ),
-                        ],
-                        flags: MessageFlags.Ephemeral,
-                    });
-
-                    await refreshDashboard(interaction, cfg, guildId, client);
-                },
-                onTimeout: async (rootInteraction) => {
-                    await InteractionHelper.safeEditReply(rootInteraction, {
-                        embeds: [
-                            new EmbedBuilder()
-                                .setTitle('Dashboard Timed Out')
-                                .setDescription('This dashboard has been closed due to inactivity. Please run the command again to continue.')
-                                .setColor(getColor('error')),
-                        ],
-                        components: [],
-                        flags: MessageFlags.Ephemeral,
-                    });
-                },
-            });
-        } catch (error) {
-            if (error instanceof TitanBotError) throw error;
-            logger.error('Unexpected error in verification_dashboard:', error);
-            throw new TitanBotError(
-                `Verification dashboard failed: ${error.message}`,
-                ErrorTypes.UNKNOWN,
-                'Failed to open the verification dashboard.',
-            );
-        }
-    },
-};
-
-async function handleChannel(selectInteraction, rootInteraction, cfg, guildId, client) {
-    await selectInteraction.deferUpdate();
-
-    const channelSelect = new ChannelSelectMenuBuilder()
-        .setCustomId('verif_cfg_channel')
-        .setPlaceholder('Select a text channel...')
-        .addChannelTypes(ChannelType.GuildText)
-        .setMaxValues(1);
-
-    await selectInteraction.followUp({
-        embeds: [
-            new EmbedBuilder()
-                .setTitle('Change Verification Channel')
-                .setDescription(
-                    `**Current:** ${cfg.channelId ?`<#${cfg.channelId}>`: '`Not set`'}\n\nSelect the channel where the verification panel will be posted.\n\n> ⚠️ The existing panel will be deleted and re-posted in the new channel.`,
-                )
-                .setColor(getColor('info')),
-        ],
-        components: [new ActionRowBuilder().addComponents(channelSelect)],
-        flags: MessageFlags.Ephemeral,
-    });
-
-    const chanCollector = rootInteraction.channel.createMessageComponentCollector({
-        componentType: ComponentType.ChannelSelect,
-        filter: i =>
-            i.user.id === selectInteraction.user.id && i.customId === 'verif_cfg_channel',
-        time: 60_000,
-        max: 1,
-    });
-
-    chanCollector.on('collect', async chanInteraction => {
-        await chanInteraction.deferUpdate();
-        const newChannel = chanInteraction.channels.first();
-
-        if (!botHasPermission(newChannel, ['ViewChannel', 'SendMessages', 'EmbedLinks'])) {
-            await replyUserError(chanInteraction, {
-                type: ErrorTypes.PERMISSION,
-                message: `I need **View Channel**, **Send Messages**, and **Embed Links** permissions in ${newChannel}.`,
-            });
-            return;
-        }
-
-        if (cfg.channelId && cfg.messageId) {
-            const oldChannel = rootInteraction.guild.channels.cache.get(cfg.channelId);
-            if (oldChannel) {
-                try {
-                    const oldMsg = await oldChannel.messages.fetch(cfg.messageId).catch(() => null);
-                    if (oldMsg) await oldMsg.delete();
-                } catch {
-                    
-                }
-            }
-        }
-
-        if (cfg.enabled !== false) {
-            try {
-                const verifyEmbed = new EmbedBuilder()
-                    .setTitle('Server Verification')
-                    .setDescription(cfg.message || botConfig.verification.defaultMessage)
-                    .setColor(getColor('success'));
-
-                const verifyButton = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder()
-                        .setCustomId('verify_user')
-                        .setLabel(cfg.buttonText || botConfig.verification.defaultButtonText)
-                        .setStyle(ButtonStyle.Success)
-                        .setEmoji('✅'),
-                );
-
-                const newMsg = await newChannel.send({ embeds: [verifyEmbed], components: [verifyButton] });
-                cfg.messageId = newMsg.id;
-            } catch (error) {
-                logger.warn('Could not post verification panel in new channel:', error.message);
-            }
-        }
-
-        cfg.channelId = newChannel.id;
-        const latestConfig = await getGuildConfig(client, guildId);
-        latestConfig.verification = cfg;
-        await setGuildConfig(client, guildId, latestConfig);
-
-        await chanInteraction.followUp({
-            embeds: [successEmbed('Channel Updated', `Verification panel moved to ${newChannel}.`)],
-            flags: MessageFlags.Ephemeral,
-        });
-
-        await refreshDashboard(rootInteraction, cfg, guildId, client);
-    });
-
-    chanCollector.on('end', (collected, reason) => {
-        if (reason === 'time' && collected.size === 0) {
-            replyUserError(selectInteraction, {
-                type: ErrorTypes.RATE_LIMIT,
-                message: 'No channel was selected. The setting was not changed.',
-            }).catch(() => {});
-        }
-    });
-}
-
-async function handleRole(selectInteraction, rootInteraction, cfg, guildId, client) {
-    await selectInteraction.deferUpdate();
-
-    const roleSelect = new RoleSelectMenuBuilder()
-        .setCustomId('verif_cfg_role')
-        .setPlaceholder('Select a role...')
-        .setMaxValues(1);
-
-    await selectInteraction.followUp({
-        embeds: [
-            new EmbedBuilder()
-                .setTitle('Change Verified Role')
-                .setDescription(
-                    `**Current:** ${cfg.roleId ?`<@&${cfg.roleId}>`: '`Not set`'}\n\nSelect the role to assign when a user verifies.`,
-                )
-                .setColor(getColor('info')),
-        ],
-        components: [new ActionRowBuilder().addComponents(roleSelect)],
-        flags: MessageFlags.Ephemeral,
-    });
-
-    const roleCollector = rootInteraction.channel.createMessageComponentCollector({
-        componentType: ComponentType.RoleSelect,
-        filter: i =>
-            i.user.id === selectInteraction.user.id && i.customId === 'verif_cfg_role',
-        time: 60_000,
-        max: 1,
-    });
-
-    roleCollector.on('collect', async roleInteraction => {
-        await roleInteraction.deferUpdate();
-        const role = roleInteraction.roles.first();
-        const guild = rootInteraction.guild;
-        const botMember = guild.members.me;
-
-        if (role.id === guild.id || role.managed) {
-            await replyUserError(roleInteraction, {
-                type: ErrorTypes.VALIDATION,
-                message: 'Please choose a normal assignable role (not @everyone or a bot-managed role).',
-            });
-            return;
-        }
-
-        if (role.position >= botMember.roles.highest.position) {
-            await replyUserError(roleInteraction, {
-                type: ErrorTypes.PERMISSION,
-                message: 'The verified role must be below my highest role in the server role hierarchy.',
-            });
-            return;
-        }
-
-        cfg.roleId = role.id;
-        const latestConfig = await getGuildConfig(client, guildId);
-        latestConfig.verification = cfg;
-        await setGuildConfig(client, guildId, latestConfig);
-
-        await roleInteraction.followUp({
-            embeds: [successEmbed('Role Updated', `Verified role set to ${role}.`)],
-            flags: MessageFlags.Ephemeral,
-        });
-
-        await refreshDashboard(rootInteraction, cfg, guildId, client);
-    });
-
-    roleCollector.on('end', (collected, reason) => {
-        if (reason === 'time' && collected.size === 0) {
-            replyUserError(selectInteraction, {
-                type: ErrorTypes.RATE_LIMIT,
-                message: 'No role was selected. The setting was not changed.',
-            }).catch(() => {});
-        }
-    });
-}
-
-async function handleMessage(selectInteraction, rootInteraction, cfg, guildId, client) {
-    try {
-        const modal = new ModalBuilder()
-            .setCustomId('verif_cfg_message')
-            .setTitle('Edit Verification Message')
-            .addComponents(
-                new ActionRowBuilder().addComponents(
-                    new TextInputBuilder()
-                        .setCustomId('message_input')
-                        .setLabel('Message shown on the verification panel embed')
-                        .setStyle(TextInputStyle.Paragraph)
-                        .setValue(cfg.message || botConfig.verification.defaultMessage)
-                        .setMaxLength(2000)
-                        .setMinLength(1)
-                        .setRequired(true),
-                ),
-            );
-
-        await selectInteraction.showModal(modal);
-
-        const submitted = await selectInteraction
-            .awaitModalSubmit({
-                filter: i =>
-                    i.customId === 'verif_cfg_message' && i.user.id === selectInteraction.user.id,
-                time: 120_000,
-            })
-            .catch(() => null);
-
-        if (!submitted) return;
-
-        cfg.message = submitted.fields.getTextInputValue('message_input').trim();
-
-        const latestConfig = await getGuildConfig(client, guildId);
-        latestConfig.verification = cfg;
-        await setGuildConfig(client, guildId, latestConfig);
-
-        await updateLivePanel(rootInteraction.guild, cfg);
-
-        await submitted.reply({
-            embeds: [successEmbed('Message Updated', 'The verification panel has been updated with the new message.')],
-            flags: MessageFlags.Ephemeral,
-        });
-
-        await refreshDashboard(rootInteraction, cfg, guildId, client);
-    } catch (error) {
-        logger.error('Error in handleMessage:', error);
-        
-    }
-}
-
-async function handleButtonText(selectInteraction, rootInteraction, cfg, guildId, client) {
-    try {
-        const modal = new ModalBuilder()
-            .setCustomId('verif_cfg_button_text')
-            .setTitle('Edit Button Text')
-            .addComponents(
-                new ActionRowBuilder().addComponents(
-                    new TextInputBuilder()
-                        .setCustomId('button_text_input')
-                        .setLabel('Button label (max 80 characters)')
-                        .setStyle(TextInputStyle.Short)
-                        .setValue(cfg.buttonText || botConfig.verification.defaultButtonText)
-                        .setMaxLength(80)
-                        .setMinLength(1)
-                        .setRequired(true),
-                ),
-            );
-
-        await selectInteraction.showModal(modal);
-
-        const submitted = await selectInteraction
-            .awaitModalSubmit({
-                filter: i =>
-                    i.customId === 'verif_cfg_button_text' && i.user.id === selectInteraction.user.id,
-                time: 120_000,
-            })
-            .catch(() => null);
-
-        if (!submitted) return;
-
-        cfg.buttonText = submitted.fields.getTextInputValue('button_text_input').trim();
-
-        const latestConfig = await getGuildConfig(client, guildId);
-        latestConfig.verification = cfg;
-        await setGuildConfig(client, guildId, latestConfig);
-
-        await updateLivePanel(rootInteraction.guild, cfg);
-
-        await submitted.reply({
-            embeds: [successEmbed('Button Text Updated', `The verify button now reads **${cfg.buttonText}**.`)],
-            flags: MessageFlags.Ephemeral,
-        });
-
-        await refreshDashboard(rootInteraction, cfg, guildId, client);
-    } catch (error) {
-        logger.error('Error in handleButtonText:', error);
-        
-    }
-    async function handleUnverifiedRole(selectInteraction, rootInteraction, cfg, guildId, client) {
-    await selectInteraction.deferUpdate();
-    const roleSelect = new RoleSelectMenuBuilder()
-        .setCustomId('verif_cfg_unverified_role')
-        .setPlaceholder('Select the Unverified role...')
-        .setMaxValues(1);
-
-    await selectInteraction.followUp({
-        embeds: [
-            new EmbedBuilder()
-                .setTitle('Change Unverified Role')
-                .setDescription(`**Current:** ${cfg.unverifiedRoleId ? `<@&${cfg.unverifiedRoleId}>` : '`Not set`'}\n\nThis role will be removed when a user clicks Verify.`)
-                .setColor(getColor('info')),
-        ],
-        components: [new ActionRowBuilder().addComponents(roleSelect)],
-        flags: MessageFlags.Ephemeral,
-    });
-
-    const roleCollector = rootInteraction.channel.createMessageComponentCollector({
-        componentType: ComponentType.RoleSelect,
-        filter: i => i.user.id === selectInteraction.user.id && i.customId === 'verif_cfg_unverified_role',
-        time: 60_000,
-        max: 1,
-    });
-
-    roleCollector.on('collect', async roleInteraction => {
-        await roleInteraction.deferUpdate();
-        const role = roleInteraction.roles.first();
-        cfg.unverifiedRoleId = role.id;
-        const latestConfig = await getGuildConfig(client, guildId);
-        latestConfig.verification = cfg;
-        await setGuildConfig(client, guildId, latestConfig);
-        await roleInteraction.followUp({
-            embeds: [successEmbed('Unverified Role Updated', `Unverified role set to ${role}.`)],
-            flags: MessageFlags.Ephemeral,
-        });
-        await refreshDashboard(rootInteraction, cfg, guildId, client);
+    verifyUser,
+    autoVerifyOnJoin,
+    removeVerification,
+    validateVerificationSetup,
+    validateBotCanAssignRole,
+    checkVerificationCooldown,
+    trackVerificationAttempt,
+    validateAutoVerifyCriteria
 };
