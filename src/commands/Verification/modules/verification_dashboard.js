@@ -714,4 +714,4 @@ async function handleButtonText(selectInteraction, rootInteraction, cfg, guildId
         });
         await refreshDashboard(rootInteraction, cfg, guildId, client);
     });
-}
+};
