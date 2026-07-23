@@ -713,5 +713,4 @@ async function handleButtonText(selectInteraction, rootInteraction, cfg, guildId
             flags: MessageFlags.Ephemeral,
         });
         await refreshDashboard(rootInteraction, cfg, guildId, client);
-    });
 };
