@@ -88,10 +88,14 @@ export async function verifyUser(client, guildId, userId, options = {}) {
             };
         }
 
-        await checkVerificationCooldown(userId, guildId, defaultCooldownMs);
+              await checkVerificationCooldown(userId, guildId, defaultCooldownMs);
         await trackVerificationAttempt(userId, guildId, defaultMaxAttempts, defaultAttemptWindowMs);
 
+        // Add Verified Role
         await member.roles.add(verifiedRole.id, `User verified (${source})`);
+
+        // NEW: Remove Unverified Role when user clicks Verify button
+        await removeUnverifiedRole(member, guildConfig.verification);
 
         logVerificationAction(client, guildId, userId, 'verified', {
             source,
@@ -672,6 +676,26 @@ export function validateAutoVerifyCriteria(criteria, accountAgeDays) {
     }
     
     return { criteria, accountAgeDays };
+}
+/** Remove Unverified Role after verification */
+async function removeUnverifiedRole(member, verificationConfig) {
+    const unverifiedRoleId = verificationConfig?.unverifiedRoleId;
+    if (!unverifiedRoleId) return;
+
+    const unverifiedRole = member.guild.roles.cache.get(unverifiedRoleId);
+    if (!unverifiedRole) return;
+
+    if (member.roles.cache.has(unverifiedRole.id)) {
+        try {
+            await member.roles.remove(unverifiedRole.id, 'User verified - removed Unverified role');
+            logger.info('Removed Unverified role', {
+                guildId: member.guild.id,
+                userId: member.id
+            });
+        } catch (e) {
+            logger.warn('Could not remove Unverified role', { error: e.message });
+        }
+    }
 }
 
 export default {
