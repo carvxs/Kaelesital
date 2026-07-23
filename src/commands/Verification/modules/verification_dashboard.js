@@ -295,22 +295,25 @@ export default {
                 buttonMatcher: (customId) =>
                     customId === `verif_cfg_toggle_${guildId}` || customId === `verif_cfg_repost_${guildId}`,
                 onSelect: async (selectInteraction) => {
-                    const selectedOption = selectInteraction.values[0];
-                    switch (selectedOption) {
-                        case 'channel':
-                            await handleChannel(selectInteraction, interaction, cfg, guildId, client);
-                            break;
-                        case 'role':
-                            await handleRole(selectInteraction, interaction, cfg, guildId, client);
-                            break;
-                        case 'message':
-                            await handleMessage(selectInteraction, interaction, cfg, guildId, client);
-                            break;
-                        case 'button_text':
-                            await handleButtonText(selectInteraction, interaction, cfg, guildId, client);
-                            break;case 'unverified_role':
-                            await handleUnverifiedRole(selectInteraction, interaction, cfg, guildId, client);
-                            break;
+    const selectedOption = selectInteraction.values[0];
+    switch (selectedOption) {
+        case 'channel':
+            await handleChannel(selectInteraction, interaction, cfg, guildId, client);
+            break;
+        case 'role':
+            await handleRole(selectInteraction, interaction, cfg, guildId, client);
+            break;
+        case 'unverified_role':   // ← Add this
+            await handleUnverifiedRole(selectInteraction, interaction, cfg, guildId, client);
+            break;
+        case 'message':
+            await handleMessage(selectInteraction, interaction, cfg, guildId, client);
+            break;
+        case 'button_text':
+            await handleButtonText(selectInteraction, interaction, cfg, guildId, client);
+            break;
+    }
+},
                     }
                 },
                 onButton: async (btnInteraction) => {
