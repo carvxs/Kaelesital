@@ -112,6 +112,11 @@ function buildSelectMenu(guildId) {
                 .setDescription('Change the label on the verify button')
                 .setValue('button_text')
                 .setEmoji('🔘'),
+            new StringSelectMenuOptionBuilder()
+                .setLabel('Change Unverified Role')
+                .setDescription('Set the role that gets removed when user verifies')
+                .setValue('unverified_role')
+                .setEmoji('🚫'),
         );
 }
 
@@ -303,6 +308,8 @@ export default {
                             break;
                         case 'button_text':
                             await handleButtonText(selectInteraction, interaction, cfg, guildId, client);
+                            break;case 'unverified_role':
+                            await handleUnverifiedRole(selectInteraction, interaction, cfg, guildId, client);
                             break;
                     }
                 },
@@ -666,4 +673,42 @@ async function handleButtonText(selectInteraction, rootInteraction, cfg, guildId
         logger.error('Error in handleButtonText:', error);
         
     }
+    async function handleUnverifiedRole(selectInteraction, rootInteraction, cfg, guildId, client) {
+    await selectInteraction.deferUpdate();
+    const roleSelect = new RoleSelectMenuBuilder()
+        .setCustomId('verif_cfg_unverified_role')
+        .setPlaceholder('Select the Unverified role...')
+        .setMaxValues(1);
+
+    await selectInteraction.followUp({
+        embeds: [
+            new EmbedBuilder()
+                .setTitle('Change Unverified Role')
+                .setDescription(`**Current:** ${cfg.unverifiedRoleId ? `<@&${cfg.unverifiedRoleId}>` : '`Not set`'}\n\nThis role will be removed when a user clicks Verify.`)
+                .setColor(getColor('info')),
+        ],
+        components: [new ActionRowBuilder().addComponents(roleSelect)],
+        flags: MessageFlags.Ephemeral,
+    });
+
+    const roleCollector = rootInteraction.channel.createMessageComponentCollector({
+        componentType: ComponentType.RoleSelect,
+        filter: i => i.user.id === selectInteraction.user.id && i.customId === 'verif_cfg_unverified_role',
+        time: 60_000,
+        max: 1,
+    });
+
+    roleCollector.on('collect', async roleInteraction => {
+        await roleInteraction.deferUpdate();
+        const role = roleInteraction.roles.first();
+        cfg.unverifiedRoleId = role.id;
+        const latestConfig = await getGuildConfig(client, guildId);
+        latestConfig.verification = cfg;
+        await setGuildConfig(client, guildId, latestConfig);
+        await roleInteraction.followUp({
+            embeds: [successEmbed('Unverified Role Updated', `Unverified role set to ${role}.`)],
+            flags: MessageFlags.Ephemeral,
+        });
+        await refreshDashboard(rootInteraction, cfg, guildId, client);
+    });
 }
