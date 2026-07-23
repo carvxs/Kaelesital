@@ -294,7 +294,7 @@ export default {
                 selectMenuId: `verif_cfg_${guildId}`,
                 buttonMatcher: (customId) =>
                     customId === `verif_cfg_toggle_${guildId}` || customId === `verif_cfg_repost_${guildId}`,
-                onSelect: async (selectInteraction) => {
+              onSelect: async (selectInteraction) => {
     const selectedOption = selectInteraction.values[0];
     switch (selectedOption) {
         case 'channel':
@@ -303,7 +303,7 @@ export default {
         case 'role':
             await handleRole(selectInteraction, interaction, cfg, guildId, client);
             break;
-        case 'unverified_role':   // ← Add this
+        case 'unverified_role':
             await handleUnverifiedRole(selectInteraction, interaction, cfg, guildId, client);
             break;
         case 'message':
