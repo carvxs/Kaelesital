@@ -51,12 +51,12 @@ const VerificationConfigSchema = z
     channelId: z.string().nullable().optional(),
     messageId: z.string().nullable().optional(),
     roleId: z.string().optional(),
+    unverifiedRoleId: z.string().nullable().optional(), // ← Added this line
     message: z.string().optional(),
     buttonText: z.string().default('Verify'),
     autoVerify: AutoVerifyConfigSchema
   })
   .optional();
-
 export const GuildConfigSchema = z
   .object({
     prefix: z.string().optional(),
